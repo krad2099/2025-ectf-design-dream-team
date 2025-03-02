@@ -213,4 +213,162 @@ int update_subscription(pkt_len_t pkt_len, subscription_update_packet_t *update)
         if (decoder_status.subscribed_channels[i].id == update->channel || !decoder_status.subscribed_channels[i].active) {
             decoder_status.subscribed_channels[i].active = true;
             decoder_status.subscribed_channels[i].id = update->channel;
-            decoder
+            decoder_status.subscribed_channels[i].start_timestamp = update->start_timestamp;
+            decoder_status.subscribed_channels[i].end_timestamp = update->end_timestamp;
+            break;
+        }
+    }
+
+    // If we do not have any room for more subscriptions
+    if (i == MAX_CHANNEL_COUNT) {
+        STATUS_LED_RED();
+        print_error("Failed to update subscription - max subscriptions installed\n");
+        return -1;
+    }
+
+    flash_simple_erase_page(FLASH_STATUS_ADDR);
+    flash_simple_write(FLASH_STATUS_ADDR, &decoder_status, sizeof(flash_entry_t));
+    // Success message with an empty body
+    write_packet(SUBSCRIBE_MSG, NULL, 0);
+    return 0;
+}
+
+/** @brief Processes a packet containing frame data.
+ *
+ *  @param pkt_len A pointer to the incoming packet.
+ *  @param new_frame A pointer to the incoming packet.
+ *
+ *  @return 0 if successful.  -1 if data is from unsubscribed channel.
+*/
+int decode(pkt_len_t pkt_len, frame_packet_t *new_frame) {
+    char output_buf[128] = {0};
+    uint16_t frame_size;
+    channel_id_t channel;
+
+    // Frame size is the size of the packet minus the size of non-frame elements
+    frame_size = pkt_len - (sizeof(new_frame->channel) + sizeof(new_frame->timestamp));
+    channel = new_frame->channel;
+
+    // The reference design doesn't use the timestamp, but you may want to in your design
+    // timestamp_t timestamp = new_frame->timestamp;
+
+    // Check that we are subscribed to the channel...
+    print_debug("Checking subscription\n");
+    if (is_subscribed(channel)) {
+        print_debug("Subscription Valid\n");
+        /* The reference design doesn't need any extra work to decode, but your design likely will.
+        *  Do any extra decoding here before returning the result to the host. */
+        write_packet(DECODE_MSG, new_frame->data, frame_size);
+        return 0;
+    } else {
+        STATUS_LED_RED();
+        sprintf(
+            output_buf,
+            "Receiving unsubscribed channel data.  %u\n", channel);
+        print_error(output_buf);
+        return -1;
+    }
+}
+
+/** @brief Initializes peripherals for system boot.
+*/
+void init() {
+    int ret;
+
+    // Initialize the flash peripheral to enable access to persistent memory
+    flash_simple_init();
+
+    // Read starting flash values into our flash status struct
+    flash_simple_read(FLASH_STATUS_ADDR, &decoder_status, sizeof(flash_entry_t));
+    if (decoder_status.first_boot != FLASH_FIRST_BOOT) {
+        /* If this is the first boot of this decoder, mark all channels as unsubscribed.
+        *  This data will be persistent across reboots of the decoder. Whenever the decoder
+        *  processes a subscription update, this data will be updated.
+        */
+        print_debug("First boot.  Setting flash...\n");
+
+        decoder_status.first_boot = FLASH_FIRST_BOOT;
+
+        channel_status_t subscription[MAX_CHANNEL_COUNT];
+
+        for (int i = 0; i < MAX_CHANNEL_COUNT; i++){
+            subscription[i].start_timestamp = DEFAULT_CHANNEL_TIMESTAMP;
+            subscription[i].end_timestamp = DEFAULT_CHANNEL_TIMESTAMP;
+            subscription[i].active = false;
+        }
+
+        // Write the starting channel subscriptions into flash.
+        memcpy(decoder_status.subscribed_channels, subscription, MAX_CHANNEL_COUNT*sizeof(channel_status_t));
+
+        flash_simple_erase_page(FLASH_STATUS_ADDR);
+        flash_simple_write(FLASH_STATUS_ADDR, &decoder_status, sizeof(flash_entry_t));
+    }
+
+    // Initialize the uart peripheral to enable serial I/O
+    ret = uart_init();
+    if (ret < 0) {
+        STATUS_LED_ERROR();
+        // if uart fails to initialize, do not continue to execute
+        while (1);
+    }
+}
+
+int main(void) {
+    char output_buf[128] = {0};
+    uint8_t uart_buf[100];
+    msg_type_t cmd;
+    int result;
+    uint16_t pkt_len;
+
+    // initialize the device
+    init();
+
+    print_debug("Decoder Booted!\n");
+
+    // process commands forever
+    while (1) {
+        print_debug("Ready\n");
+
+        STATUS_LED_GREEN();
+
+        result = read_packet(&cmd, uart_buf, &pkt_len);
+
+        if (result < 0) {
+            STATUS_LED_ERROR();
+            print_error("Failed to receive cmd from host\n");
+            continue;
+        }
+
+        // Handle the requested command
+        switch (cmd) {
+
+        case LIST_MSG:
+            STATUS_LED_CYAN();
+
+            #ifdef CRYPTO_EXAMPLE
+                // Run the crypto example
+                crypto_example();
+            #endif // CRYPTO_EXAMPLE
+
+            boot_flag();
+            list_channels();
+            break;
+
+        case DECODE_MSG:
+            STATUS_LED_PURPLE();
+            decode(pkt_len, (frame_packet_t *)uart_buf);
+            break;
+
+        case SUBSCRIBE_MSG:
+            STATUS_LED_YELLOW();
+            update_subscription(pkt_len, (subscription_update_packet_t *)uart_buf);
+            break;
+
+        default:
+            STATUS_LED_ERROR();
+            sprintf(output_buf, "Invalid Command: %c\n", cmd);
+            print_error(output_buf);
+            break;
+        }
+    }
+}
